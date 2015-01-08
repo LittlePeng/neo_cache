@@ -1,0 +1,11 @@
+*~
+erl_crash.dump
+*#
+/ebin
+/log
+*.boot
+/src/*.erl~
+/src/.*.erl
+/src/*.erl.swp
+/src/*.erl#
+tags

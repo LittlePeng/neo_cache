@@ -1,0 +1,12 @@
+{application, neo_cache,
+ [
+  {description, ""},
+  {vsn, "1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {mod, { neo_cache_app, []}},
+  {env, []}
+ ]}.
