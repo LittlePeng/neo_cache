@@ -13,6 +13,7 @@ start_link(PeerEp, Socket) ->
 
 init([PeerEp, Socket]) ->
     cache_parser:init(),
+    neo_counter:inc(neo_cache, connection),
     {ok, #state{peer=PeerEp, socket=Socket}}.
 
 handle_call(info, _From, State) ->
@@ -50,7 +51,8 @@ process_packet(Bin, State) ->
         {ok, Reqs} ->
            lager:debug("bin:~p.req:~p", [Bin, Reqs]),
            lists:foldl(
-                fun(Req, {ok, State0}) ->
+                fun([Cmd | ReqArgs], {ok, State0}) ->
+                        Req = [cache_util:upper(Cmd) | ReqArgs],
                         process_request(Req, State0);
                    (_Req, Err) ->
                         Err
@@ -61,41 +63,67 @@ process_packet(Bin, State) ->
 
 process_request([], State) ->
     {ok, State};
-process_request([<<"quit">>], _State) ->
+process_request([<<"QUIT">>], _State) ->
     {error, quit};
-process_request([<<"fetch">>, _Vmin, _Vmax], State) ->
-    {ok, State};
-process_request([<<"get">>, Key], State) ->
-    tcp_string(Key, State);
-process_request([<<"set">>, _Key, _Value], State) ->
-    tcp_ok(State);
-process_request([<<"info">>], State) ->
+process_request([<<"APPEND">>, Key, Field, Value, Version0, PerVersion0], State) ->
+    Version = binary_to_integer(Version0),
+    PerVersion = binary_to_integer(PerVersion0),
+    Len = cache_db:append(Key, Field, Value, Version, PerVersion),
+    tcp_string(integer_to_list(Len), State);
+process_request([<<"FETCH">>, Key, Vmin0, Vmax0], State) ->
+    Vmin = binary_to_integer(Vmin0),
+    Vmax = binary_to_integer(Vmax0),
+    %format Full:1 Field\r\n Version:8 PreVersion:8 ValLen:4 Val(... list)
+    DList = cache_db:fetch(Key, Vmin, Vmax),
+    Rsp = lists:flatmap(fun({Field0, Full, List}) ->
+                        ListBin = lists:map(fun({Value, Version, PerVersion}) ->
+                                        <<Version:64/little, PerVersion:64/little,
+                                          (size(Value)):32/little, Value/binary>>
+                                end, List),
+                        Field = <<(neo_util:to_binary(Full))/binary,
+                                  (neo_util:to_binary(Field0))/binary>>,
+                        [Field, ListBin]
+                end, DList),
+    tcp_multi_bulk(Rsp, State);
+process_request([<<"DEL">>, Key], State) ->
+    OK = cache_db:del(Key),
+    tcp_string(integer_to_list(OK), State);
+process_request([<<"INFO">>], State) ->
     Info = io_lib:format("~p~n~4096p", [neo_counter:i(), cache_db:info()]),
     tcp_string(Info, State);
-process_request(Req, State) ->
-    tcp_err(["not support request: " | Req], State).
+
+%% test cmd
+process_request([<<"GET">>, Key], State) ->
+    tcp_string(Key, State);
+process_request([<<"SET">>, _Key, _Value], State) ->
+    tcp_ok(State);
+
+process_request(Req0, State) ->
+    Req = [[<<" ">>, Arg] || Arg <- Req0],
+    tcp_err(["unsupport: " | Req], State).
 
 tcp_err(Message, State) ->
-      tcp_send(["-ERR ", Message], State).
+    tcp_send(["-ERR ", Message, "\r\n"], State).
 
 tcp_ok(State) ->
-    tcp_string("OK", State).
+    tcp_string("OK\r\n", State).
 
 tcp_string(Message, State) ->
-    tcp_send(["+", Message], State).
+    tcp_send(["+", Message, "\r\n"], State).
+
+tcp_multi_bulk([], State) ->
+    tcp_send("*0\r\n", State);
+tcp_multi_bulk(Rsp, State) ->
+    Len = integer_to_list(length(Rsp)),
+    Rsp1 = [["$", integer_to_list(iolist_size(Field)), "\r\n", Field, "\r\n"] || Field <- Rsp],
+    Rsp2 = ["*", Len, "\r\n" | Rsp1],
+    io:format("~p", [Rsp2]),
+    tcp_send(Rsp2, State).
 
 tcp_send(Message, State) ->
     lager:debug("~p << ~s~n", [State#state.peer, Message]),
-    try gen_tcp:send(State#state.socket, [Message, "\r\n"]) of
+    case gen_tcp:send(State#state.socket, Message) of
         ok -> {ok, State};
-        {error, closed} ->
-            lager:debug("Connection closed~n", []),
-            {error, closed};
-        {error, Error} ->
-            lager:error("Couldn't send msg through TCP~n\tError: ~p~n", [Error]),
-            {error, Error}
-    catch
-        _:Exception ->
-            lager:error("Couldn't send msg through TCP~n\tError: ~p~n", [Exception]),
-            {error, Exception}
+        Error ->
+            lager:error("rsp error", [Error])
     end.
