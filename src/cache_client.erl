@@ -66,11 +66,13 @@ process_request([], State) ->
 process_request([<<"QUIT">>], _State) ->
     {error, quit};
 process_request([<<"APPEND">>, Key, Field, Value, Version0, PerVersion0], State) ->
+    neo_counter:inc(neo_cache, append),
     Version = binary_to_integer(Version0),
     PerVersion = binary_to_integer(PerVersion0),
     Len = cache_db:append(Key, Field, Value, Version, PerVersion),
     tcp_string(integer_to_list(Len), State);
 process_request([<<"FETCH">>, Key, Vmin0, Vmax0], State) ->
+    neo_counter:inc(neo_cache, fetch),
     Vmin = binary_to_integer(Vmin0),
     Vmax = binary_to_integer(Vmax0),
     %format Full:1 Field\r\n Version:8 PreVersion:8 ValLen:4 Val(... list)
@@ -86,8 +88,19 @@ process_request([<<"FETCH">>, Key, Vmin0, Vmax0], State) ->
                 end, DList),
     tcp_multi_bulk(Rsp, State);
 process_request([<<"DEL">>, Key], State) ->
+    neo_counter:inc(neo_cache, del),
     OK = cache_db:del(Key),
     tcp_string(integer_to_list(OK), State);
+process_request([<<"LLEN">>, Key], State) ->
+    Len = cache_db:llen(Key),
+    tcp_string(integer_to_list(Len), State);
+process_request([<<"TTL">>, Key], State) ->
+    Ttl = cache_db:ttl(Key),
+    tcp_string(integer_to_list(Ttl), State);
+process_request([<<"DUMP">>, Key], State) ->
+    Obj = cache_db:dump(Key),
+    R = io_lib:format("~p", [Obj]),
+    tcp_string(R, State);
 process_request([<<"INFO">>], State) ->
     Info = io_lib:format("~p~n~4096p", [neo_counter:i(), cache_db:info()]),
     tcp_string(Info, State);

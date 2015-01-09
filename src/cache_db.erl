@@ -5,12 +5,20 @@
 -export([start_link/1]).
 -export([init/1, handle_call/3, handle_info/2, handle_cast/2]).
 -export([terminate/2, code_change/3]).
--export([database/1, append/5, del/1, fetch/3, info/0, info/1]).
+-export([database/1, append/5, del/1, fetch/3, info/0, llen/1, ttl/1, dump/1, info/1]).
 
 -define(DBID(Key), database(erlang:phash2(Key) rem ?DB_COUNT)).
+
+-define(MAX_MEM, 100 * 1024 * 1024).
 -define(MAX_ALIGN_TIMOUT, 10*60). % 对齐超时时间
 -define(MAX_FIELD_LEN, 20). % 一个field 最大长度
 -define(MAX_FIELD_COUNT, 50). % 最大field数量
+-define(MAX_EXPIRE_COUNT, 100).
+-define(KEY_EXPIRE_TIME, 7 * 24 * 3600).
+
+-define(EXPIRE_CHECK_INTERVAL, 5000).
+-define(KEY_LRU, '__lru__').
+-define(KEY_INDEX, '__index__').
 
 -record(state, {len=0, append=0, del=0, fetch=0}).
 -record(list, {len=0, atime=cache_time:now(), index=0,
@@ -39,13 +47,25 @@ append(Key0, Field0, Value, Version, PreVersion) ->
     Msg = #msg{value=Value, version=Version, pre_version=PreVersion, time=cache_time:now()},
     gen_server:call(?DBID(Key), {append, Key, Field, Msg}).
 
+fetch(Key0, Vmin, Vmax) ->
+    Key = cache_util:try_to_int(Key0),
+    gen_server:call(?DBID(Key), {fetch, Key, Vmin, Vmax}).
+
 del(Key0) ->
     Key = cache_util:try_to_int(Key0),
     gen_server:call(?DBID(Key), {del, Key}).
 
-fetch(Key0, Vmin, Vmax) ->
+llen(Key0) ->
     Key = cache_util:try_to_int(Key0),
-    gen_server:call(?DBID(Key), {fetch, Key, Vmin, Vmax}).
+    gen_server:call(?DBID(Key), {llen, Key}).
+
+ttl(Key0) ->
+    Key = cache_util:try_to_int(Key0),
+    gen_server:call(?DBID(Key), {ttl, Key}).
+
+dump(Key0) ->
+    Key = cache_util:try_to_int(Key0),
+    gen_server:call(?DBID(Key), {dump, Key}).
 
 info() ->
     [info(Id) || Id <- lists:seq(0, ?DB_COUNT -1)].
@@ -55,23 +75,46 @@ info(DB_Id) ->
 
 init([]) ->
     lru_init(),
+    ensure_check_timer(),
     {ok, #state{}}.
 
-handle_call({append, Key, Field, Msg}, _From, State) ->
-    R = do_append(Key, Field, Msg),
+handle_call({append, Key, Field, Msg}, _From, State0) ->
+    {R, State} = do_append(Key, Field, Msg, State0),
     {reply, R, State#state{append=State#state.append+1}};
 handle_call({del, Key}, _From, State) ->
-    {reply, do_del(Key), State#state{del=State#state.del+1}};
-handle_call({fetch, Key, VMax, VMin}, _From, State) ->
-    {reply, do_fetch(Key, VMax, VMin), State#state{fetch=State#state.fetch+1}};
-handle_call(info, _From, State) ->
-    {reply, State, State};
+    {R, State} = do_del(Key, State),
+    {reply, R, State#state{del=State#state.del+1}};
+handle_call({llen, Key}, _From, State) ->
+    R = case get(Key) of
+        undefined -> 0;
+        #list{len=Len} -> Len
+    end,
+    {reply, R, State};
+handle_call({ttl, Key}, _From, State) ->
+    Ttl = case get(Key) of
+        #list{atime=ATime} -> ?KEY_EXPIRE_TIME - (cache_time:now() - ATime);
+        _ -> -1
+    end,
+    {reply, Ttl, State};
+handle_call({dump, Key}, _From, State) ->
+    {reply, get(Key), State};
+handle_call({fetch, Key, VMax, VMin}, _From, State0) ->
+    {R, State} = do_fetch(Key, VMax, VMin, State0),
+    {reply, R, State#state{fetch=State#state.fetch+1}};
+handle_call(info, _From, #state{fetch=Fetch, append=Append, del=Del}=State) ->
+    R = [{fetch, Fetch}, {append, Append}, {del, Del}],
+    {reply, R, State};
 handle_call(_Req, _From, State) ->
     {reply, not_support, State}.
 
 handle_cast(_Req, State) ->
     {noreply, State}.
 
+handle_info(check_expire, State) ->
+    % 清理过期
+    % 处理内存压力阈值时，LRU清理
+    ensure_check_timer(),
+    {noreply, do_lru_expire(State), hibernate};
 handle_info(_Req, State) ->
     {noreply, State}.
 
@@ -81,10 +124,16 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-do_del(Key) ->
-    case erase(Key) of
-        undefined -> 0;
-        _ -> 1
+ensure_check_timer() ->
+    erlang:send_after(?EXPIRE_CHECK_INTERVAL, self(), check_expire).
+
+do_del(Key, State) ->
+    case get(Key) of
+        undefined ->
+            {0, State};
+        List ->
+            delete_key(Key, List),
+            {1, State#state{len=State#state.len-1}}
     end.
 
 % 匹配的时候一定要同时匹配下界和上界
@@ -92,47 +141,80 @@ do_del(Key) ->
 % 1. 完整的下界，全部对其
 % 2. 因单个会话量大被踢，不保证对其
 % 中间部分 Fields 过长可能不连续
-do_fetch(Key, VMin, VMax) ->
+do_fetch(Key, VMin, VMax, State) ->
     case get(Key) of
-        undefined -> [];
-        #list{align_dict=Dict}=List -> 
-            % 顺延ttl & 清理过期msgs
-            List1 = try_trim(List),
-            List2 = lru_update(Key, List1),
-            put(Key, List2),
-            lists:map(fun({Field, ValueList}) ->
-                        {Field, 1, [{Value, Version, PreVersion} ||
-                                #msg{value=Value, version=Version,
-                                     pre_version=PreVersion} <- ValueList]}
-                end, dict:to_list(Dict))
+        undefined -> {[], State};
+        List -> 
+            case try_align(List) of
+                {ok, List1} ->
+                    R = get_inc(List1, VMin, VMax),
+                    % 顺延ttl & 清理过期msgs
+                    List2 = try_trim(List1),
+                    List3 = lru_update(Key, List2),
+                    put(Key, List3),
+                    {R, State};
+                _ ->
+                    delete_key(Key, List),
+                    {[], State#state{len=State#state.len-1}}
+            end
     end.
 
-do_append(Key, Field, Msg) ->
-    List0 = case get(Key) of
+get_inc(#list{align_dict=Dict, align_max=AlignMax, align_min=AlignMin},
+        VMin, VMax) when AlignMax >= VMax ->
+    dict:fold(fun(Field, ValueList, DAcc) ->
+                R = lists:foldl(fun(#msg{value=Value, version=Version, pre_version=PreVersion}, Acc) ->
+                                case Version >= VMin andalso Version =< VMax of
+                                    true -> [{Value, Version, PreVersion} | Acc];
+                                    false -> Acc
+                                end
+                        end, [], ValueList),
+                case length(R) > 0 of
+                    true ->
+                        %TODO: IsFull 此处不精确
+                        IsFull = case AlignMin > VMin of
+                            true -> 1;
+                            false -> 0
+                        end,
+                        [{Field, IsFull, lists:reverse(R)} | DAcc];
+                    false ->
+                        DAcc
+                end
+        end, [], Dict);
+get_inc(_List, _VMin, _VMax) ->
+    [].
+
+do_append(Key, Field, Msg, State0) ->
+    {List0, State} = case get(Key) of
         undefined ->
             NewList=lru_new_list(Key),
-            NewList#list{align_max=Msg#msg.pre_version,
-                         align_min=Msg#msg.pre_version};
-        V -> V
+            NewList2=NewList#list{align_max=Msg#msg.pre_version,
+                                  align_min=Msg#msg.pre_version},
+            {NewList2, State0#state{len=State0#state.len+1}};
+
+        V -> {V, State0}
     end,
     case try_append(List0, Field, Msg) of
          {ok, List} ->
             put(Key, List),
-            List#list.len;
+            {List#list.len, State};
          _Err ->
-            lru_delete(Key, List0),
-            erase(Key),
-            0
+            delete_key(Key, List0),
+            {0, State#state{len=State#state.len-1}} 
     end.
+
+delete_key(Key, List) ->
+    lager:debug("delete key:~p", [Key]),
+    lru_delete(Key, List),
+    erase(Key).
 
 try_append(#list{align_max=MaxVersion}=List0, Field, #msg{pre_version=MaxVersion}=Msg) ->
     append_msg(Field, Msg, List0);
 try_append(#list{unaligns=UAS}=List0, Field, Msg) ->
-    neo_counter:inc(db, append_align_failed),
+    neo_counter:inc(cache_db, append_align_failed),
     List = List0#list{unaligns=[{Field, Msg} | UAS]},
     case length(UAS) > 1 of
         true -> try_align(List);
-        false -> List
+        false -> {ok, List}
     end.
 
 % 对齐后添加
@@ -200,32 +282,83 @@ try_align(#list{unaligns=UAS, align_max=MaxVersion}=List) ->
             end
     end.
 
-try_trim(List) ->
-    List.
+try_trim(#list{len=Len, align_dict=Dict}=List) ->
+    Now = cache_util:now(),
+    {Dict2, Dels2} = dict:fold(fun(Field, ValueList, {Dict0, Del0}) ->
+                    ValueList2 = lists:filter(fun(#msg{time=CTime}) ->
+                                    Now - CTime < ?KEY_EXPIRE_TIME
+                            end, ValueList),
+                    Dict1=
+                    case length(ValueList2) > 0 of
+                        true -> dict:store(Field, ValueList2, Dict0);
+                        false -> dict:erase(Field, Dict0)
+                    end,
+                    Dels1 = (length(ValueList) - length(ValueList2)),
+                    {Dict1, Del0 + Dels1}
+            end, {Dict, 0}, Dict),
+    List#list{len=Len-Dels2, align_dict=Dict2}.
+
+do_lru_expire(State) ->
+    Lru = get(?KEY_LRU),
+    Force = erlang:memory(total) > ?MAX_MEM,
+    {Lru2, Dels} = collect_expire(Lru, Force),
+    case Dels > 0 of
+        true ->
+            case Force of
+                true -> neo_counter:inc(cache_db, evicted);
+                false -> neo_counter:inc(cache_db, expired)
+            end,
+            lager:debug("expire delete:~pitem", [Dels]);
+        false -> ok
+    end,
+    put(?KEY_LRU, Lru2),
+    State#state{len=State#state.len-Dels}.
+
+collect_expire(Lru, Force) ->
+    collect_expire(Lru, Force, 0).
+
+collect_expire(Lru, _Force, ?MAX_EXPIRE_COUNT) ->
+    {Lru, ?MAX_EXPIRE_COUNT};
+collect_expire(Lru, Force, AccCount) ->
+    case gb_trees:is_empty(Lru) of
+        true -> {Lru, AccCount};
+        false ->
+            {_Index, Key, LruRst} = gb_trees:take_smallest(Lru),
+            List = #list{atime=Atime} = get(Key),
+            CanRm = case Force of
+                true -> true;
+                false ->
+                    Atime - cache_time:now() > ?KEY_EXPIRE_TIME
+            end,
+            case CanRm of
+                true ->
+                    delete_key(Key, List),
+                    collect_expire(LruRst, Force, AccCount+1);
+                false ->
+                    {Lru, AccCount}
+            end
+    end.
 
 %%%%% LRU %%%%%%%%
 lru_init() ->
-    put(index, 0),
-    put(lru, gb_trees:empty()).
+    put(?KEY_INDEX, 0),
+    put(?KEY_LRU, gb_trees:empty()).
 
 lru_next_index() ->
-    Index = get(index) + 1,
-    put(index, Index),
+    Index = get(?KEY_INDEX) + 1,
+    put(?KEY_INDEX, Index),
     Index.
 
 lru_new_list(Key) ->
     Index = lru_next_index(),
-    put(lru, gb_trees:insert(Index, Key, get(lru))),
+    put(?KEY_LRU, gb_trees:insert(Index, Key, get(?KEY_LRU))),
     #list{index=Index}.
 
 lru_update(Key, #list{index=Index}=List) ->
-    Lru = gb_trees:delete(Index, get(lru)),
+    Lru = gb_trees:delete(Index, get(?KEY_LRU)),
     NewIndex = lru_next_index(),
-    put(lru, gb_trees:insert(NewIndex, Key, Lru)),
+    put(?KEY_LRU, gb_trees:insert(NewIndex, Key, Lru)),
     List#list{atime=cache_time:now(), index=NewIndex}.
 
-lru_delete(Key, #list{index=Index}) ->
-    put(lru, gb_trees:delete(Index, get(lru))).
-
-lru_clean() ->
-    todo.
+lru_delete(_Key, #list{index=Index}) ->
+    put(?KEY_LRU, gb_trees:delete(Index, get(?KEY_LRU))).
