@@ -6,6 +6,7 @@
 -export([init/1, handle_call/3, handle_info/2, handle_cast/2]).
 -export([terminate/2, code_change/3]).
 -export([database/1, append/5, del/1, fetch/3, info/0, llen/1, ttl/1, dump/1, info/1]).
+-export([random_key/0, flush_all/0]).
 
 -define(DBID(Key), database(erlang:phash2(Key) rem ?DB_COUNT)).
 
@@ -67,11 +68,20 @@ dump(Key0) ->
     Key = cache_util:try_to_int(Key0),
     gen_server:call(?DBID(Key), {dump, Key}).
 
+random_key() ->
+    gen_server:call(?DBID(os:timestamp()), random_key).
+
+flush(DBId) ->
+    gen_server:call(database(DBId), flush).
+
+flush_all() ->
+    [flush(Id) || Id <- lists:seq(0, ?DB_COUNT -1)].
+
 info() ->
     [info(Id) || Id <- lists:seq(0, ?DB_COUNT -1)].
 
-info(DB_Id) ->
-    gen_server:call(database(DB_Id), info).
+info(DBId) ->
+    gen_server:call(database(DBId), info).
 
 init([]) ->
     lru_init(),
@@ -96,11 +106,17 @@ handle_call({ttl, Key}, _From, State) ->
         _ -> -1
     end,
     {reply, Ttl, State};
-handle_call({dump, Key}, _From, State) ->
-    {reply, get(Key), State};
 handle_call({fetch, Key, VMax, VMin}, _From, State0) ->
     {R, State} = do_fetch(Key, VMax, VMin, State0),
     {reply, R, State#state{fetch=State#state.fetch+1}};
+handle_call({dump, Key}, _From, State) ->
+    {reply, get(Key), State};
+handle_call(random_key, _From, State) ->
+    {reply, lru_min(), State};
+handle_call(flush, _From, State) ->
+    erase(),
+    lru_init(),
+    {reply, ok, State, hibernate};
 handle_call(info, _From, #state{fetch=Fetch, append=Append, del=Del}=State) ->
     R = [{fetch, Fetch}, {append, Append}, {del, Del}],
     {reply, R, State};
@@ -111,8 +127,9 @@ handle_cast(_Req, State) ->
     {noreply, State}.
 
 handle_info(check_expire, State) ->
-    % 清理过期
-    % 处理内存压力阈值时，LRU清理
+    % 1. 清理过期数据
+    % 2. 内存压力阈值时，LRU清理替换
+    % 3. hibernate 强制GC (TODO 内存较大时, 需考虑Major GC效率)
     ensure_check_timer(),
     {noreply, do_lru_expire(State), hibernate};
 handle_info(_Req, State) ->
@@ -164,18 +181,18 @@ get_inc(#list{align_dict=Dict, align_max=AlignMax, align_min=AlignMin},
     dict:fold(fun(Field, ValueList, DAcc) ->
                 R = lists:foldl(fun(#msg{value=Value, version=Version, pre_version=PreVersion}, Acc) ->
                                 case Version >= VMin andalso Version =< VMax of
-                                    true -> [{Value, Version, PreVersion} | Acc];
+                                    true -> [[Version, PreVersion, Value] | Acc];
                                     false -> Acc
                                 end
                         end, [], ValueList),
                 case length(R) > 0 of
                     true ->
                         %TODO: IsFull 此处不精确
-                        IsFull = case AlignMin > VMin of
+                        IsFull = case AlignMin >= VMin of
                             true -> 1;
                             false -> 0
                         end,
-                        [{Field, IsFull, lists:reverse(R)} | DAcc];
+                        [[Field, IsFull, R] | DAcc];
                     false ->
                         DAcc
                 end
@@ -305,8 +322,8 @@ do_lru_expire(State) ->
     case Dels > 0 of
         true ->
             case Force of
-                true -> neo_counter:inc(cache_db, evicted);
-                false -> neo_counter:inc(cache_db, expired)
+                true -> neo_counter:inc(cache_db, evicted, Dels);
+                false -> neo_counter:inc(cache_db, expired, Dels)
             end,
             lager:debug("expire delete:~pitem", [Dels]);
         false -> ok
@@ -362,3 +379,12 @@ lru_update(Key, #list{index=Index}=List) ->
 
 lru_delete(_Key, #list{index=Index}) ->
     put(?KEY_LRU, gb_trees:delete(Index, get(?KEY_LRU))).
+
+lru_min() ->
+    Lru = get(?KEY_LRU),
+    case gb_trees:is_empty(Lru) of
+        true -> undefined;
+        false ->
+            {_Index, Key, _LruRst} = gb_trees:take_smallest(Lru),
+            neo_util:to_binary(Key)
+    end.

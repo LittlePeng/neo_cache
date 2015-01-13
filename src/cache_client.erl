@@ -48,17 +48,17 @@ code_change(_OldVsn, State, _Extra) ->
 
 process_packet(Bin, State) ->
     case cache_parser:parser(Bin) of
+        {ok, []} ->
+            {ok, State};
+        {ok, [[Cmd | ReqArgs]]} ->
+            process_request([cache_util:upper(Cmd) | ReqArgs], State);
         {ok, Reqs} ->
-           lager:debug("bin:~p.req:~p", [Bin, Reqs]),
-           lists:foldl(
-                fun([Cmd | ReqArgs], {ok, State0}) ->
-                        Req = [cache_util:upper(Cmd) | ReqArgs],
-                        process_request(Req, State0);
-                   (_Req, Err) ->
-                        Err
-                end, {ok, State}, Reqs);
-        PErr ->
-            PErr
+            % pipeline process
+            put(pipeline, []),
+            [process_request([cache_util:upper(Cmd) | ReqArgs], State) ||
+                [Cmd | ReqArgs] <- Reqs],
+            tcp_flush(State);
+           PErr -> PErr
     end.
 
 process_request([], State) ->
@@ -75,18 +75,9 @@ process_request([<<"FETCH">>, Key, Vmin0, Vmax0], State) ->
     neo_counter:inc(neo_cache, fetch),
     Vmin = binary_to_integer(Vmin0),
     Vmax = binary_to_integer(Vmax0),
-    %format Full:1 Field\r\n Version:8 PreVersion:8 ValLen:4 Val(... list)
+    %[[Field, IsFull, [[Version, PreVersion,  Val] | ...]] | ....]
     DList = cache_db:fetch(Key, Vmin, Vmax),
-    Rsp = lists:flatmap(fun({Field0, Full, List}) ->
-                        ListBin = lists:map(fun({Value, Version, PerVersion}) ->
-                                        <<Version:64/little, PerVersion:64/little,
-                                          (size(Value)):32/little, Value/binary>>
-                                end, List),
-                        Field = <<(neo_util:to_binary(Full))/binary,
-                                  (neo_util:to_binary(Field0))/binary>>,
-                        [Field, ListBin]
-                end, DList),
-    tcp_multi_bulk(Rsp, State);
+    tcp_multi_bulk(DList, State);
 process_request([<<"DEL">>, Key], State) ->
     neo_counter:inc(neo_cache, del),
     OK = cache_db:del(Key),
@@ -101,6 +92,11 @@ process_request([<<"DUMP">>, Key], State) ->
     Obj = cache_db:dump(Key),
     R = io_lib:format("~p", [Obj]),
     tcp_string(R, State);
+process_request([<<"RANDOMKEY">>], State) ->
+    tcp_string(cache_db:random_key(), State);
+process_request([<<"FLUSHALL">>], State) ->
+    cache_db:flush_all(),
+    tcp_ok(State);
 process_request([<<"INFO">>], State) ->
     Info = io_lib:format("~p~n~4096p", [neo_counter:i(), cache_db:info()]),
     tcp_string(Info, State);
@@ -119,24 +115,48 @@ tcp_err(Message, State) ->
     tcp_send(["-ERR ", Message, "\r\n"], State).
 
 tcp_ok(State) ->
-    tcp_string("OK\r\n", State).
+    tcp_string("OK", State).
 
+tcp_string(undefined, State) ->
+    tcp_send(["$-1\r\n"], State);
 tcp_string(Message, State) ->
     tcp_send(["+", Message, "\r\n"], State).
 
-tcp_multi_bulk([], State) ->
-    tcp_send("*0\r\n", State);
-tcp_multi_bulk(Rsp, State) ->
-    Len = integer_to_list(length(Rsp)),
-    Rsp1 = [["$", integer_to_list(iolist_size(Field)), "\r\n", Field, "\r\n"] || Field <- Rsp],
-    Rsp2 = ["*", Len, "\r\n" | Rsp1],
-    io:format("~p", [Rsp2]),
-    tcp_send(Rsp2, State).
+tcp_multi_bulk(Messages, State) ->
+    tcp_send(create_multi_bulk(Messages), State).
+
+create_multi_bulk([]) ->
+    ["*0\r\n"];
+create_multi_bulk(Messages) ->
+    Bulk1 = lists:map(
+        fun(Val) when is_integer(Val) ->
+                [":", integer_to_list(Val), "\r\n"];
+           (Val) when is_list(Val) ->
+                create_multi_bulk(Val);
+           (Val) ->
+                ["$", integer_to_list(iolist_size(Val)), "\r\n", Val, "\r\n"]
+        end, Messages),
+    ["*", integer_to_list(length(Messages)), "\r\n" | Bulk1].
+
+tcp_flush(State) ->
+    case erase(pipeline) of
+        undefined ->
+            {ok, State};
+        Pipes ->
+            tcp_send(lists:reverse(Pipes), State)
+    end.
 
 tcp_send(Message, State) ->
-    lager:debug("~p << ~s~n", [State#state.peer, Message]),
-    case gen_tcp:send(State#state.socket, Message) of
-        ok -> {ok, State};
-        Error ->
-            lager:error("rsp error", [Error])
+    case get(pipeline) of
+        undefined ->
+            lager:debug("~p << ~s~n", [State#state.peer, Message]),
+            case gen_tcp:send(State#state.socket, Message) of
+                ok -> {ok, State};
+                Error ->
+                    lager:error("rsp error", [Error]),
+                    {error, Error}
+            end;
+        Pipes ->
+            put(pipeline, [Message | Pipes]),
+            {ok, State}
     end.
