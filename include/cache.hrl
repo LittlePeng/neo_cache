@@ -1,1 +1,1 @@
--define(DB_COUNT, 1).
+-define(DB_COUNT, 1024).

@@ -28,7 +28,7 @@ init([]) ->
     ClientSpec = ?SUP_CHILD(cache_client_sup, cache_client_sup, []),
     CSpec = ?WORKER_CHILD(neo_counter, neo_counter, [[neo_cache, cache_db]]),
 
-    Port = application:get_env(neo_cache, port, 6379),
+    Port = application:get_env(neo_cache, tcp_port, 8000),
     LSpec = ?WORKER_CHILD(cache_listener, cache_listener, [Port]),
 
     {ok, {{one_for_one, 5, 10}, DBSpec ++ [TimeSpec,  ClientSpec, CSpec, LSpec]}}.

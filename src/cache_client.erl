@@ -47,14 +47,17 @@ code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 process_packet(Bin, State) ->
+    lager:debug("Bin:~p", [Bin]),
     case cache_parser:parser(Bin) of
         {ok, []} ->
             {ok, State};
         {ok, [[Cmd | ReqArgs]]} ->
+            neo_counter:inc(neo_cache, reqs),
             process_request([cache_util:upper(Cmd) | ReqArgs], State);
         {ok, Reqs} ->
             % pipeline process
             put(pipeline, []),
+            neo_counter:inc(neo_cache, reqs, length(Reqs)),
             [process_request([cache_util:upper(Cmd) | ReqArgs], State) ||
                 [Cmd | ReqArgs] <- Reqs],
             tcp_flush(State);
@@ -66,15 +69,21 @@ process_request([], State) ->
 process_request([<<"QUIT">>], _State) ->
     {error, quit};
 process_request([<<"APPEND">>, Key, Field, Value, Version0, PerVersion0], State) ->
-    neo_counter:inc(neo_cache, append),
     Version = binary_to_integer(Version0),
     PerVersion = binary_to_integer(PerVersion0),
     Len = cache_db:append(Key, Field, Value, Version, PerVersion),
     tcp_string(integer_to_list(Len), State);
+process_request([<<"FETCH">>, Key], State) ->
+    process_request([<<"FETCH">>, Key, <<"0">>, infinite], State);
+process_request([<<"FETCH">>, Key, Vmin], State) ->
+    process_request([<<"FETCH">>, Key, Vmin, infinite], State);
 process_request([<<"FETCH">>, Key, Vmin0, Vmax0], State) ->
     neo_counter:inc(neo_cache, fetch),
     Vmin = binary_to_integer(Vmin0),
-    Vmax = binary_to_integer(Vmax0),
+    Vmax = case is_binary(Vmax0) of
+        true -> binary_to_integer(Vmax0);
+        false -> Vmax0
+    end,
     %[[Field, IsFull, [[Version, PreVersion,  Val] | ...]] | ....]
     DList = cache_db:fetch(Key, Vmin, Vmax),
     tcp_multi_bulk(DList, State);
@@ -98,9 +107,20 @@ process_request([<<"FLUSHALL">>], State) ->
     cache_db:flush_all(),
     tcp_ok(State);
 process_request([<<"INFO">>], State) ->
-    Info = io_lib:format("~p~n~4096p", [neo_counter:i(), cache_db:info()]),
+    Mem = erlang:memory(total) div (1024*1024),
+    DBInfos =
+    lists:foldl(fun(DB, Dict0) ->
+                lists:foldl(fun({Key, Val}, Dict) ->
+                            dict:update_counter(Key, Val, Dict)
+                    end, Dict0, DB)
+        end, dict:new(),  cache_db:info()),
+    Info = io_lib:format("~p~n~4096p~n~4096p~n",
+                         [neo_counter:i(), dict:to_list(DBInfos), [{mem, Mem}]]),
     tcp_string(Info, State);
 
+process_request([<<"INFO">>, <<"db">>], State) ->
+    Dbs = io_lib:format("~4096p~n", [cache_db:info()]),
+    tcp_string(Dbs, State);
 %% test cmd
 process_request([<<"GET">>, Key], State) ->
     tcp_string(Key, State);
