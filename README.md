@@ -1,26 +1,29 @@
 # neo_cache
-2015-1-13=============
-性能测试
-设备：12core*2.0G /128GB
-客户端数: 100
+ ======2015-1-13=============
+
+- 性能测试 
+- 设备：12core*2.0G /128GB
+- 客户端数: 100
 
 append:
-Value: 长度 50 字节
-DB_COUNT=1 7w/s CPU:800%
-DB_COUNT=24 11w/s  CPU:1300%
-DB_COUNT=1024 11w/s CPU:1300%
-设置默认1024, 30GB下每个进程30M,Major GC影响小
+
+- Value: 长度 50 字节
+- DB_COUNT=1 7w/s CPU:800%
+- DB_COUNT=24 11w/s  CPU:1300%
+- DB_COUNT=1024 11w/s CPU:1300%
+- 设置默认1024, 30GB下每个进程30M,Major GC影响小
 
 
 pipeline:
-*2: 20w/s CPU 1800%
-*5/*10: 30w/s CPU 2000%
+
+- *2: 20w/s CPU 1800%
+- *5/*10: 30w/s CPU 2000%
 
 memory:
-1kw用户 * 10条
-写入完后: 30GB 平均每条占用300字节 强制GC后->20GB
+- 1kw用户 * 10条
+- 写入完后: 30GB 平均每条占用300字节 强制GC后->20GB
 
-没有达到要求，基于c redis版本修改实现见：https://github.com/LittlePeng/redis
+- 没有达到要求，基于c redis版本修改实现见：https://github.com/LittlePeng/redis
 
 ====================================
 增量消息存储按照会话存储初步方案实现：
@@ -37,5 +40,3 @@ memory:
 - 读取时再丢弃过长会话
 - 比较高效，因为读比例很少
 - 依然需要对使用redis或其他存储做修改，以方面自动维护一周数据
-
-
